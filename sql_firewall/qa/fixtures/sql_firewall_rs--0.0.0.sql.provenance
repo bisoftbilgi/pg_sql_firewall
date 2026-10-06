@@ -1,0 +1,6 @@
+pre-change installation script for sql_firewall_rs 0.0.0
+sha256: 3adef75a0c858be0ae508fd18f152223b1b7c9574bba853958f9d4b4163834d8
+source_digest: 9d260ed682268ef269e9ee525088023206b3878f95a70dd067064678f9416dab
+git_diff_head_sha256: d6efec8a53328341eaac76c7e18b371b2b37ece7c26151d1da52a0a86e5ff2f2
+captured from packaged sql_firewall_rs--0.0.0.sql of QA run sqlfw-qa.9WVKK2
+built from this working tree before the 0.0.1 privilege fix

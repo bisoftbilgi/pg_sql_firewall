@@ -1,0 +1,33 @@
+# Build products and test output
+**/target/
+*.tar.gz
+*.tar.gz.sha256
+*.log
+benchmark_results_*/
+
+# Private development records; retained locally, excluded from the product repo
+/PRODUCTION_READINESS.md
+/sql_firewall/docs/archive/
+/sql_firewall/docs/MANUAL_DBA_ACCEPTANCE.md
+/sql_firewall/qa/legacy/
+/.local/
+
+# Local credentials and machine settings
+.env
+.env.*
+!.env.example
+.pgpass
+.netrc
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Editor, backup and OS files
+.DS_Store
+.idea/
+*.iml
+**/*.rs.bk
+*.swp
+*.swo
+*~

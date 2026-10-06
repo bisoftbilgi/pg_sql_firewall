@@ -1,0 +1,7 @@
+# Cargo build output; keep Cargo.lock for reproducible release builds.
+/target/
+
+# PostgreSQL regression output
+/tests/pg_regress/results/
+/tests/pg_regress/regression.diffs
+/tests/pg_regress/regression.out
