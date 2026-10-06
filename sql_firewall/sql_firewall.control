@@ -1,0 +1,6 @@
+comment = 'SQL firewall: command and fingerprint approvals, rules, rate limits, and audit'
+default_version = '0.0.0'
+module_pathname = '$libdir/sql_firewall'
+relocatable = false
+superuser = true
+trusted = false

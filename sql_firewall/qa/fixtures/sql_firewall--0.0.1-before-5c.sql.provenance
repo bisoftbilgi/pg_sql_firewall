@@ -1,0 +1,6 @@
+earlier 0.0.1 installation script for sql_firewall (before Phase 5C policy backup)
+sha256: 7687976bbb43e5a6a3c8b8d38ee42ca716dcde7700222a8446222fb1c56e13d8
+source_digest: 8bcf5e75ce9fa1dd079aaea45270e5e63728fc7d236bcbd18fcb6efc1993646d
+git_diff_head_sha256: ac2782e3d7e1489ff3015c2a5349ad24f92143a16948d2bd974471c963eb8a8c
+captured from packaged sql_firewall--0.0.1.sql of QA run sqlfw-qa.ihhWVE
+built from this working tree at the end of Phase 5B, before the Phase 5C schema change

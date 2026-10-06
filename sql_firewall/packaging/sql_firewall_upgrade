@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# sql_firewall update tool (README 6.9a).
+#
+# Usage: sql_firewall_upgrade [connection options] (--check | --yes) [--backup-dir DIR | --no-backup]
+#
+#   -h, --host HOST      server host or socket directory   (default: libpq default)
+#   -p, --port PORT      server port                        (default: libpq default)
+#   -U, --user USER      a superuser                        (default: libpq default)
+#   --dbname DB          database used to list databases    (default: postgres)
+#   --bindir DIR         directory of psql, pg_dump, pg_dumpall, pg_restore (default: PATH)
+#   --target VERSION     version to update to (default: the server's available default_version)
+#   --check              report what would be done and whether the server is ready; change nothing
+#   --yes                back up, update every database that has an older version, and verify
+#   --backup-dir DIR     where to write roles.sql and one pg_dump -Fc per database (required with --yes);
+#                        the backup holds data and role password hashes: its directory is created
+#                        0700 and its files 0600, whatever the caller's umask
+#   --no-backup          update without a backup (not recommended)
+#   --worker-timeout S   seconds to wait for each database's consumer after the update (default 60)
+#
+# Every database that allows connections is checked, template databases
+# included (a database created from template1 inherits its extension version).
+# Databases that do not allow connections are listed as not checked.
+#
+# Ready means: the library is preloaded, the server runs the library of the
+# target version (so the server was restarted after the new package was
+# installed), and every database to update has an update path from its version.
+#
+# Each database is updated in one REPEATABLE READ transaction that compares
+# the policy before and after the update script and commits only when they
+# are equal; otherwise it rolls back and the database keeps its version.
+# Exit codes: 0 done or ready or nothing to do; 1 an update or check failed;
+# 2 usage or connection error; 3 not ready (the report says why).
+set -uo pipefail
+# Backups contain table data and role password hashes.
+umask 077
+
+HOST="" PORT="" USER_NAME="" MAINT=postgres BINDIR="" TARGET="" MODE="" BACKUP="" NOBACKUP=0 WORKER_TIMEOUT=60
+while (($#)); do
+    case $1 in
+        -h | --host) HOST=$2; shift ;;
+        -p | --port) PORT=$2; shift ;;
+        -U | --user) USER_NAME=$2; shift ;;
+        --dbname) MAINT=$2; shift ;;
+        --bindir) BINDIR=$2; shift ;;
+        --target) TARGET=$2; shift ;;
+        --check) MODE=check ;;
+        --yes) MODE=apply ;;
+        --backup-dir) BACKUP=$2; shift ;;
+        --no-backup) NOBACKUP=1 ;;
+        --worker-timeout) WORKER_TIMEOUT=$2; shift ;;
+        --help) sed -n '2,24p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+[[ -n $MODE ]] || { echo "choose --check or --yes (see --help)" >&2; exit 2; }
+if [[ $MODE == apply && -z $BACKUP && $NOBACKUP == 0 ]]; then
+    echo "--yes needs --backup-dir DIR (or --no-backup)" >&2
+    exit 2
+fi
+tool() { if [[ -n $BINDIR ]]; then echo "$BINDIR/$1"; else command -v "$1"; fi; }
+PSQL=$(tool psql) PG_DUMP=$(tool pg_dump) PG_DUMPALL=$(tool pg_dumpall) PG_RESTORE=$(tool pg_restore)
+[[ -x $PSQL ]] || { echo "psql not found (use --bindir)" >&2; exit 2; }
+CONN=()
+[[ -n $HOST ]] && CONN+=(-h "$HOST")
+[[ -n $PORT ]] && CONN+=(-p "$PORT")
+[[ -n $USER_NAME ]] && CONN+=(-U "$USER_NAME")
+
+# q DB SQL -> single value (rows joined by newline); nonzero on error
+q() { PGDATABASE=$1 PGAPPNAME=sql_firewall_upgrade "$PSQL" -X -q -A -t -v ON_ERROR_STOP=1 "${CONN[@]}" -c "$2" 2>&1; }
+literal() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]; }
+say() { printf '%s\n' "$*"; }
+# qq DB SQL -> value; on a query error prints it and fails (callers: || exit 2)
+qq() {
+    local out
+    out=$(q "$1" "$2") || { echo "query failed in database $1: $out" >&2; return 1; }
+    printf '%s\n' "$out"
+}
+
+# --- server -----------------------------------------------------------------
+if ! su=$(q "$MAINT" "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user"); then
+    echo "connection failed: $su" >&2
+    exit 2
+fi
+[[ $su == t ]] || { echo "connect as a superuser (current user is not)" >&2; exit 2; }
+server=$(qq "$MAINT" "SHOW server_version") || exit 2
+preload=$(qq "$MAINT" "SHOW shared_preload_libraries") || exit 2
+available=$(qq "$MAINT" "SELECT coalesce((SELECT default_version FROM pg_catalog.pg_available_extensions WHERE name = 'sql_firewall'), '')") || exit 2
+[[ -n $available ]] || { echo "sql_firewall is not installed in this PostgreSQL installation (no control file)" >&2; exit 3; }
+TARGET=${TARGET:-$available}
+literal "$TARGET" || { echo "invalid target version '$TARGET'" >&2; exit 2; }
+
+dblist=$(qq "$MAINT" "SELECT datname FROM pg_catalog.pg_database WHERE datallowconn ORDER BY 1") || exit 2
+mapfile -t DBS <<<"$dblist"
+templates=$(qq "$MAINT" "SELECT datname FROM pg_catalog.pg_database WHERE datallowconn AND datistemplate ORDER BY 1") || exit 2
+declare -A TEMPLATE
+while IFS= read -r t; do [[ -n $t ]] && TEMPLATE[$t]=1; done <<<"$templates"
+# template0 never allows connections and never holds an extension.
+unchecked=$(qq "$MAINT" "SELECT coalesce(string_agg(datname, ', ' ORDER BY datname), '') FROM pg_catalog.pg_database WHERE NOT datallowconn AND datname OPERATOR(pg_catalog.<>) 'template0'") || exit 2
+declare -A INSTALLED PATHS
+running=""
+for db in "${DBS[@]}"; do
+    [[ -n $db ]] || continue
+    v=$(qq "$db" "SELECT coalesce((SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'sql_firewall'), '')") || exit 2
+    [[ -n $v ]] || continue
+    INSTALLED[$db]=$v
+    if [[ -z $running ]]; then
+        running=$(q "$db" "SELECT coalesce(running_version, '') FROM public.sql_firewall_library_version()") || running=""
+    fi
+    if [[ $v != "$TARGET" ]]; then
+        literal "$v" || { echo "unexpected installed version '$v' in $db" >&2; exit 2; }
+        # path is text ('0.0.0--0.0.1'), NULL when there is none
+        PATHS[$db]=$(qq "$db" "SELECT coalesce((SELECT pg_catalog.replace(path, '--', ' -> ') FROM pg_catalog.pg_extension_update_paths('sql_firewall') WHERE source = '$v' AND target = '$TARGET'), '')") || exit 2
+    fi
+done
+
+say "sql_firewall update: PostgreSQL $server; target version $TARGET (available default $available)"
+say "  shared_preload_libraries: '$preload'"
+say "  library running in the server: ${running:-unknown (no database has the extension, or the library is not preloaded)}"
+say ""
+printf '  %-30s %-18s %s\n' DATABASE INSTALLED ACTION
+todo=() problems=()
+for db in "${DBS[@]}"; do
+    [[ -n ${INSTALLED[$db]:-} ]] || continue
+    v=${INSTALLED[$db]}
+    if [[ $v == "$TARGET" ]]; then
+        action="up to date"
+    elif [[ -n ${PATHS[$db]:-} ]]; then
+        action="update via ${PATHS[$db]}"
+        todo+=("$db")
+    else
+        action="NO UPDATE PATH from $v to $TARGET"
+        problems+=("$db: no update path from $v to $TARGET (are the update scripts of this package installed?)")
+    fi
+    printf '  %-30s %-18s %s\n' "$db${TEMPLATE[$db]:+ (template)}" "$v" "$action"
+done
+((${#INSTALLED[@]})) || say "  (no database has the extension)"
+[[ -z $unchecked ]] || say "  not checked (connections not allowed): $unchecked"
+say ""
+
+if ((${#todo[@]})); then
+    [[ $preload == *sql_firewall* ]] || problems+=("the library is not in shared_preload_libraries")
+    if [[ $running != "$TARGET" ]]; then
+        problems+=("the server runs library ${running:-unknown}, not $TARGET: install the $TARGET package and restart PostgreSQL first")
+    fi
+fi
+if ((${#problems[@]})); then
+    say "NOT READY:"
+    printf '  - %s\n' "${problems[@]}"
+    exit 3
+fi
+if ((${#todo[@]} == 0)); then
+    say "nothing to update"
+    exit 0
+fi
+if [[ $MODE == check ]]; then
+    say "ready: ${#todo[@]} database(s) would be updated to $TARGET"
+    exit 0
+fi
+
+# --- backup -----------------------------------------------------------------
+# The policy as decisions: what each row decides, not counters the consumer
+# advances under live traffic (hit_count, last_seen_at). A release that
+# changes these columns updates this projection with its update script.
+DIGEST="SELECT 'policy ' || count(*) || ' ' || coalesce(md5(string_agg(r, E'\\n' ORDER BY r)), '-') FROM (
+    SELECT ROW('a', role_name, command_type, is_approved)::text AS r FROM public.sql_firewall_command_approvals
+    UNION ALL SELECT ROW('f', fingerprint, role_name, command_type, is_approved, auto_approval_disabled)::text FROM public.sql_firewall_query_fingerprints
+    UNION ALL SELECT ROW('r', pattern, is_active, allowed_roles, installation_default)::text FROM public.sql_firewall_regex_rules
+    UNION ALL SELECT ROW('d', installation_default)::text FROM public.sql_firewall_regex_default_removals
+    UNION ALL SELECT ROW('h', change_id, policy_table, operation, source, old_role_name, old_command_type, old_fingerprint,
+        old_is_approved, old_auto_approval_disabled, new_role_name, new_command_type, new_fingerprint, new_is_approved,
+        new_auto_approval_disabled)::text FROM public.sql_firewall_policy_history) s"
+if [[ -n $BACKUP ]]; then
+    dir=$BACKUP/sql_firewall-$TARGET-$(date +%Y%m%dT%H%M%S)
+    mkdir -p "$BACKUP" && mkdir -m 700 "$dir" || { echo "cannot create $dir" >&2; exit 1; }
+    chmod 700 "$dir" || exit 1
+    say "backup: $dir (mode 0700, files 0600)"
+    PGDATABASE=$MAINT "$PG_DUMPALL" "${CONN[@]}" --roles-only -f "$dir/roles.sql" || { echo "pg_dumpall --roles-only failed" >&2; exit 1; }
+    for db in "${todo[@]}"; do
+        PGDATABASE=$db "$PG_DUMP" "${CONN[@]}" -Fc -f "$dir/$db.dump" || { echo "pg_dump of $db failed" >&2; exit 1; }
+        "$PG_RESTORE" --list "$dir/$db.dump" >/dev/null || { echo "backup of $db is not readable" >&2; exit 1; }
+        say "  $db.dump  $(sha256sum "$dir/$db.dump" | cut -d' ' -f1)"
+    done
+    (cd "$dir" && sha256sum roles.sql ./*.dump >SHA256SUMS)
+    # Whatever the tools did with their own modes: nothing readable by others.
+    chmod 600 "$dir"/* || exit 1
+fi
+
+# --- update and verify --------------------------------------------------------
+failed=0
+for db in "${todo[@]}"; do
+    # Before and after in one REPEATABLE READ transaction with the update:
+    # the comparison sees exactly what the update script changed, not what
+    # concurrent sessions and the consumer commit meanwhile, and it runs
+    # before COMMIT: a changed policy raises, and the update is rolled back.
+    if ! out=$(PGDATABASE=$db PGAPPNAME=sql_firewall_upgrade "$PSQL" -X -q -A -t -v ON_ERROR_STOP=1 "${CONN[@]}" 2>&1 <<EOF
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_catalog.set_config('sql_firewall_upgrade.before', ($DIGEST), true);
+ALTER EXTENSION sql_firewall UPDATE TO '$TARGET';
+DO \$sqlfw_upgrade\$
+DECLARE
+    before text := pg_catalog.current_setting('sql_firewall_upgrade.before');
+    after text := ($DIGEST);
+BEGIN
+    IF after IS DISTINCT FROM before THEN
+        RAISE EXCEPTION 'sql_firewall_upgrade: the update changed the policy (% -> %); rolled back', before, after;
+    END IF;
+END
+\$sqlfw_upgrade\$;
+SELECT pg_catalog.current_setting('sql_firewall_upgrade.before');
+COMMIT;
+EOF
+    ); then
+        say "  $db: update FAILED and rolled back: $(tr '\n' ' ' <<<"$out")"
+        failed=1
+        continue
+    fi
+    before=$(grep '^policy ' <<<"$out" | tail -1)
+    version=$(q "$db" "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'sql_firewall'")
+    status=$(q "$db" "SELECT public.sql_firewall_status()")
+    worker=""
+    deadline=$((SECONDS + WORKER_TIMEOUT))
+    # No consumer runs in a template database (the launcher skips them, so
+    # CREATE DATABASE ... TEMPLATE can copy it).
+    while [[ -z ${TEMPLATE[$db]:-} ]]; do
+        worker=$(q "$db" "SELECT public.sql_firewall_approval_worker_status()")
+        [[ $worker == running* ]] && break
+        ((SECONDS >= deadline)) && break
+        sleep 1
+    done
+    problems=()
+    [[ $version == "$TARGET" ]] || problems+=("version is $version")
+    [[ -n $before ]] || problems+=("no policy comparison in the output")
+    [[ $status == "sql_firewall running"* || $status == "sql_firewall disabled"* ]] || problems+=("status '$status'")
+    [[ -n ${TEMPLATE[$db]:-} || $worker == running* ]] || problems+=("consumer '$worker' after ${WORKER_TIMEOUT}s")
+    if ((${#problems[@]})); then
+        say "  $db: updated to $version, verification FAILED: ${problems[*]}"
+        failed=1
+    else
+        consumer="consumer $worker"
+        [[ -n ${TEMPLATE[$db]:-} ]] && consumer="template database, no consumer"
+        say "  $db: updated to $TARGET; policy unchanged ($before); $status; $consumer"
+    fi
+done
+((failed)) && { say "update finished with failures"; exit 1; }
+say "update finished: ${#todo[@]} database(s) at $TARGET"
+exit 0
